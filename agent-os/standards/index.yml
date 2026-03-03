@@ -2,11 +2,11 @@
 
 global:
   branch-naming:
-    description: Needs description - run /index-standards
+    description: Branch naming convention: type/kebab-description, no direct commits to main
   commit-conventions:
-    description: Needs description - run /index-standards
+    description: Conventional Commits format with types, scope, and examples
   readme-standards:
-    description: Needs description - run /index-standards
+    description: Required README sections and formatting rules for all repos
   secrets-handling:
-    description: Needs description - run /index-standards
+    description: No hardcoded secrets; use OIDC, env vars, and secrets managers
 
