@@ -1,0 +1,12 @@
+# Agent OS Standards Index
+
+global:
+  branch-naming:
+    description: Needs description - run /index-standards
+  commit-conventions:
+    description: Needs description - run /index-standards
+  readme-standards:
+    description: Needs description - run /index-standards
+  secrets-handling:
+    description: Needs description - run /index-standards
+
