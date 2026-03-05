@@ -30,8 +30,25 @@ jobs:
       - name: Run unit tests
         run: pytest tests/unit/ -v
 
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra/
+          framework: terraform
+          soft_fail: false
+          # Skip checks not applicable to this PoC:
+          # CKV_AWS_115 - reserved concurrency (operational, not security)
+          # CKV_AWS_116 - DLQ (not required for a synchronous GET endpoint)
+          # CKV_AWS_117 - VPC (intentionally public API)
+          # CKV2_AWS_29 - API GW access logging (Phase 3 concern)
+          skip_check: CKV_AWS_115,CKV_AWS_116,CKV_AWS_117,CKV2_AWS_29
+
   plan:
-    needs: [lint, test]
+    needs: [lint, test, checkov]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -80,7 +97,8 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      api_url: ${{ steps.api_url.outputs.url }}
+      api_url: ${{ steps.tf_outputs.outputs.api_url }}
+      lambda_name: ${{ steps.tf_outputs.outputs.lambda_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -107,14 +125,20 @@ jobs:
       - name: Terraform Apply
         working-directory: infra
         run: terraform apply tfplan
-      - name: Get API URL
-        id: api_url
+      - name: Capture Terraform outputs
+        id: tf_outputs
         working-directory: infra
-        run: echo "url=$(terraform output -raw invoke_url)" >> $GITHUB_OUTPUT
+        run: |
+          echo "api_url=$(terraform output -raw invoke_url)" >> $GITHUB_OUTPUT
+          echo "lambda_name=$(terraform output -raw lambda_function_name)" >> $GITHUB_OUTPUT
 
   smoke:
     needs: apply
     runs-on: ubuntu-latest
+    outputs:
+      status_code: ${{ steps.verify.outputs.status_code }}
+      latency_ms: ${{ steps.verify.outputs.latency_ms }}
+      error_message: ${{ steps.on_failure.outputs.message }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -122,13 +146,31 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements-test.txt
+      - name: Capture verification result
+        id: verify
+        env:
+          API_BASE_URL: ${{ needs.apply.outputs.api_url }}
+        run: |
+          START=$(date +%s%3N)
+          HTTP_STATUS=$(curl -s -o /tmp/response.txt -w "%{http_code}" -X POST "$API_BASE_URL")
+          END=$(date +%s%3N)
+          LATENCY=$((END - START))
+          BODY=$(cat /tmp/response.txt)
+          echo "status_code=$HTTP_STATUS" >> $GITHUB_OUTPUT
+          echo "latency_ms=$LATENCY" >> $GITHUB_OUTPUT
+          echo "Verification: HTTP $HTTP_STATUS in ${LATENCY}ms — $BODY"
       - name: Run smoke tests
         env:
           API_BASE_URL: ${{ needs.apply.outputs.api_url }}
         run: pytest tests/smoke/ -v
+      - name: Capture failure reason
+        id: on_failure
+        if: failure()
+        run: |
+          echo "message=HTTP ${{ steps.verify.outputs.status_code }} from POST ${{ needs.apply.outputs.api_url }} — expected 200" >> $GITHUB_OUTPUT
 
   record:
-    needs: [lint, test, plan, apply, smoke]
+    needs: [lint, test, checkov, plan, apply, smoke]
     runs-on: ubuntu-latest
     if: always()
     permissions:
@@ -145,23 +187,58 @@ jobs:
         env:
           LINT_RESULT: ${{ needs.lint.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          CHECKOV_RESULT: ${{ needs.checkov.result }}
           PLAN_RESULT: ${{ needs.plan.result }}
           APPLY_RESULT: ${{ needs.apply.result }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
+          API_URL: ${{ needs.apply.outputs.api_url }}
+          LAMBDA_NAME: ${{ needs.apply.outputs.lambda_name }}
+          SMOKE_STATUS_CODE: ${{ needs.smoke.outputs.status_code }}
+          SMOKE_LATENCY_MS: ${{ needs.smoke.outputs.latency_ms }}
+          SMOKE_ERROR: ${{ needs.smoke.outputs.error_message }}
         run: |
           python3 - <<'PYEOF'
           import json, os
           from datetime import datetime, timezone
 
           stages = {
-            "lint":  os.environ["LINT_RESULT"],
-            "test":  os.environ["TEST_RESULT"],
-            "plan":  os.environ["PLAN_RESULT"],
-            "apply": os.environ["APPLY_RESULT"],
-            "smoke": os.environ["SMOKE_RESULT"],
+            "lint":    os.environ["LINT_RESULT"],
+            "test":    os.environ["TEST_RESULT"],
+            "checkov": os.environ["CHECKOV_RESULT"],
+            "plan":    os.environ["PLAN_RESULT"],
+            "apply":   os.environ["APPLY_RESULT"],
+            "smoke":   os.environ["SMOKE_RESULT"],
           }
           overall = "passed" if all(v == "success" for v in stages.values()) else "failed"
           failed_stages = [k for k, v in stages.items() if v != "success"]
+
+          # Deploy outputs — only populated if apply succeeded
+          deploy = {}
+          if os.environ.get("API_URL"):
+            deploy = {
+              "invoke_url":    os.environ["API_URL"],
+              "lambda_name":   os.environ.get("LAMBDA_NAME", ""),
+              "region":        "ap-southeast-2",
+            }
+
+          # Verification result — only populated if smoke ran
+          verification = {}
+          code = os.environ.get("SMOKE_STATUS_CODE", "")
+          if code:
+            verification["status_code"] = int(code) if code.isdigit() else code
+            latency = os.environ.get("SMOKE_LATENCY_MS", "")
+            if latency.isdigit():
+              verification["latency_ms"] = int(latency)
+
+          # Failure context
+          failure_context = {}
+          if failed_stages:
+            failure_context["failed_stages"] = failed_stages
+            if os.environ.get("SMOKE_ERROR"):
+              failure_context["smoke_error"] = os.environ["SMOKE_ERROR"]
+            failure_context["logs_url"] = (
+              "https://github.com/xnomle/agent-os-poc/actions/runs/${{ github.run_id }}"
+            )
 
           record = {
             "run_id":       "${{ github.run_id }}",
@@ -175,6 +252,12 @@ jobs:
             "summary":      "Pipeline passed all stages." if overall == "passed"
                             else f"Pipeline failed at: {', '.join(failed_stages)}.",
           }
+          if deploy:
+            record["deploy"] = deploy
+          if verification:
+            record["verification"] = verification
+          if failure_context:
+            record["failure_context"] = failure_context
 
           with open("run-record.json", "w") as f:
             json.dump(record, f, indent=2)

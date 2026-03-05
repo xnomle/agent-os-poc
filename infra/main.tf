@@ -19,11 +19,16 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
 
 # Lambda function
 resource "aws_lambda_function" "hello_world" {
-  function_name = "hello-world"
-  role          = aws_iam_role.lambda_exec.arn
-  filename      = var.lambda_zip_path
-  handler       = "handler.lambda_handler"
-  runtime       = "python3.12"
+  function_name    = "hello-world"
+  role             = aws_iam_role.lambda_exec.arn
+  filename         = var.lambda_zip_path
+  source_code_hash = filebase64sha256(var.lambda_zip_path)
+  handler          = "handler.lambda_handler"
+  runtime          = "python3.12"
+
+  tracing_config {
+    mode = "Active"
+  }
 }
 
 # API Gateway HTTP API
