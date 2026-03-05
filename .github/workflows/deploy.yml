@@ -18,8 +18,20 @@ jobs:
       - name: Run TFLint
         run: tflint --chdir=infra
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-test.txt
+      - name: Run unit tests
+        run: pytest tests/unit/ -v
+
   plan:
-    needs: lint
+    needs: [lint, test]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -67,6 +79,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    outputs:
+      api_url: ${{ steps.api_url.outputs.url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -93,3 +107,79 @@ jobs:
       - name: Terraform Apply
         working-directory: infra
         run: terraform apply tfplan
+      - name: Get API URL
+        id: api_url
+        working-directory: infra
+        run: echo "url=$(terraform output -raw invoke_url)" >> $GITHUB_OUTPUT
+
+  smoke:
+    needs: apply
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-test.txt
+      - name: Run smoke tests
+        env:
+          API_BASE_URL: ${{ needs.apply.outputs.api_url }}
+        run: pytest tests/smoke/ -v
+
+  record:
+    needs: [lint, test, plan, apply, smoke]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          aws-region: ap-southeast-2
+      - name: Write run record to S3
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          APPLY_RESULT: ${{ needs.apply.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          stages = {
+            "lint":  os.environ["LINT_RESULT"],
+            "test":  os.environ["TEST_RESULT"],
+            "plan":  os.environ["PLAN_RESULT"],
+            "apply": os.environ["APPLY_RESULT"],
+            "smoke": os.environ["SMOKE_RESULT"],
+          }
+          overall = "passed" if all(v == "success" for v in stages.values()) else "failed"
+          failed_stages = [k for k, v in stages.items() if v != "success"]
+
+          record = {
+            "run_id":       "${{ github.run_id }}",
+            "run_number":   ${{ github.run_number }},
+            "timestamp":    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "branch":       "${{ github.ref_name }}",
+            "commit":       "${{ github.sha }}",
+            "triggered_by": "${{ github.event_name }}",
+            "stages":       stages,
+            "overall":      overall,
+            "summary":      "Pipeline passed all stages." if overall == "passed"
+                            else f"Pipeline failed at: {', '.join(failed_stages)}.",
+          }
+
+          with open("run-record.json", "w") as f:
+            json.dump(record, f, indent=2)
+          print(json.dumps(record, indent=2))
+          PYEOF
+
+          aws s3 cp run-record.json \
+            "s3://agent-os-poc/run-records/${{ github.run_id }}.json"
