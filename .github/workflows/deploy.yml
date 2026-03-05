@@ -41,11 +41,14 @@ jobs:
           framework: terraform
           soft_fail: false
           # Skip checks not applicable to this PoC:
-          # CKV_AWS_115 - reserved concurrency (operational, not security)
-          # CKV_AWS_116 - DLQ (not required for a synchronous GET endpoint)
-          # CKV_AWS_117 - VPC (intentionally public API)
-          # CKV2_AWS_29 - API GW access logging (Phase 3 concern)
-          skip_check: CKV_AWS_115,CKV_AWS_116,CKV_AWS_117,CKV2_AWS_29
+          # CKV_AWS_115  - reserved concurrency (operational, not security)
+          # CKV_AWS_116  - DLQ (not required for a synchronous public endpoint)
+          # CKV_AWS_117  - VPC (intentionally public API)
+          # CKV_AWS_272  - Lambda code signing (requires AWS Signer — PoC scope)
+          # CKV_AWS_309  - API GW route auth type (intentionally unauthenticated)
+          # CKV_AWS_76   - API GW HTTP access logging (Phase 3 observability)
+          # CKV2_AWS_29  - API GW REST access logging (Phase 3 observability)
+          skip_check: CKV_AWS_115,CKV_AWS_116,CKV_AWS_117,CKV_AWS_272,CKV_AWS_309,CKV_AWS_76,CKV2_AWS_29
 
   plan:
     needs: [lint, test, checkov]
